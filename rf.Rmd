@@ -1,0 +1,195 @@
+---
+title: "Predicting the popularity of a song based on Spotify sound/musical metrics"
+author: 'Akshat Thakur, Navid Samiei, Asen Lee, Yichen Xin'
+date: "`r Sys.Date()`"
+output: 
+  bookdown::pdf_document2:
+    includes:
+      in_header: preamble.tex
+    number_sections: false
+    toc: FALSE
+urlcolor: blue
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, error = TRUE, echo=FALSE)
+library(MASS)
+library(class)
+library(moments)
+library(ggplot2)
+library(GGally)
+library(psych)
+library(tidyverse)
+```
+
+# Codes and Analysis
+
+```{r}
+# load dataset
+spotify_data <- read.csv("spotify_dataset.csv")
+spotify_data <- spotify_data[complete.cases(spotify_data) , ]
+variables <- c("Popularity", "Danceability", "Energy", "Loudness", 
+               "Speechiness", "Acousticness", "Liveness", "Tempo", 
+               "Valence", "Chord", "Duration..ms.")
+spotify_data <- spotify_data[variables]
+spotify_data$Chord <- as.factor(spotify_data$Chord)
+```
+
+```{r ridge-plots, error = TRUE, message=FALSE, warning=FALSE}
+library(glmnet)
+ols <- lm(Popularity ~ . , data = spotify_data)
+x <- model.matrix(ols) # grabs the design matrix from the internal lm() output
+x <- x[, -1] # remove the intercept column, glmnet() will do this for us
+y <- spotify_data$Popularity
+# missing values. glmnet() hates those. They are already dropped in x.
+set.seed(1234)
+
+# b ridge
+lambdas2 <- exp(seq(-20, 20, length = 50))
+ridge <- cv.glmnet(
+  x = x, y = y, lambda = lambdas2, nfolds = 20, alpha = 0,
+  family = "gaussian", intercept = TRUE
+)
+plot(ridge$glmnet.fit, "norm", label = TRUE, )
+rmse_ridge <- sqrt(min(ridge$cvm))
+rmse_ridge
+```
+
+``` {r random forest}
+# https://uc-r.github.io/random_forests
+library(rsample)      # data splitting 
+library(randomForest) # basic implementation
+library(ranger)       # a faster implementation of randomForest
+library(caret)        # an aggregator package for performing many machine learning models
+# Create training (70%) and test (30%) sets for the spotify data.
+# Use set.seed for reproducibility
+set.seed(1234)
+spotify_split <- initial_split(spotify_data, prop = .8)
+spotify_train <- training(spotify_split)
+spotify_test  <- testing(spotify_split)
+
+## Basic Implementation
+
+# default RF model
+rf1 <- randomForest(
+  formula = Popularity ~ .,
+  data    = spotify_train
+)
+rf1
+plot(rf1)
+
+# number of trees with lowest MSE
+which.min(rf1$mse)
+
+# RMSE of this optimal random forest
+sqrt(rf1$mse[which.min(rf1$mse)])
+
+# create training and validation data 
+set.seed(6969)
+valid_split <- initial_split(spotify_train, .8)
+spotify_train_v2 <- analysis(valid_split)
+
+# validation data
+spotify_valid <- assessment(valid_split)
+x_test <- spotify_valid[setdiff(names(spotify_valid), "Popularity")]
+y_test <- spotify_valid$Popularity
+
+rf_oob_comp <- randomForest(
+  formula = Popularity ~ .,
+  data    = spotify_train_v2,
+  xtest   = x_test,
+  ytest   = y_test
+)
+
+# extract OOB & validation errors
+oob <- sqrt(rf_oob_comp$mse)
+validation <- sqrt(rf_oob_comp$test$mse)
+
+# compare error rates
+tibble::tibble(
+  `Out of Bag Error` = oob,
+  `Test error` = validation,
+  ntrees = 1:rf_oob_comp$ntree
+) %>%
+  gather(Metric, RMSE, -ntrees) %>%
+  ggplot(aes(ntrees, RMSE, color = Metric)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::dollar) +
+  xlab("Number of trees")
+
+## Tuning
+
+# names of features
+features <- setdiff(names(spotify_train), "Popularity")
+
+set.seed(1234)
+
+# hyperparameter grid search
+hyper_grid <- expand.grid(
+  mtry       = seq(1, 1, by = 1),
+  node_size  = seq(3, 9, by = 2),
+  sampe_size = c(.55, .632, .70, .80),
+  OOB_RMSE   = 0
+)
+
+for(i in 1:nrow(hyper_grid)) {
+  
+  # train model
+  model <- ranger(
+    formula         = Popularity ~ ., 
+    data            = spotify_train, 
+    num.trees       = 500,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$node_size[i],
+    sample.fraction = hyper_grid$sampe_size[i],
+    seed            = 123
+  )
+  
+  # add OOB error to grid
+  hyper_grid$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}
+
+hyper_grid %>% 
+  dplyr::arrange(OOB_RMSE) %>%
+  head(10)
+
+# Currently, the best random forest model we have found retains columnar categorical variables and uses mtry = 1, terminal node size of 5 observations, and a sample size of 55%. Lets repeat this model to get a better expectation of our error rate.
+OOB_RMSE <- vector(mode = "numeric", length = 100)
+
+for(i in seq_along(OOB_RMSE)) {
+
+  optimal_ranger <- ranger(
+    formula         = Popularity ~ ., 
+    data            = spotify_train, 
+    num.trees       = 500,
+    mtry            = 1,
+    min.node.size   = 5,
+    sample.fraction = .55,
+    importance      = 'impurity'
+  )
+  
+  OOB_RMSE[i] <- sqrt(optimal_ranger$prediction.error)
+}
+
+hist(OOB_RMSE, breaks = 20)
+
+#
+optimal_ranger$variable.importance %>% 
+  tidy() %>%
+  dplyr::arrange(desc(x)) %>%
+  dplyr::top_n(11) %>%
+  ggplot(aes(reorder(names, x), x)) +
+  geom_col() +
+  coord_flip() +
+  ggtitle("Top 11 important variables")
+
+# prediction
+pred_ranger_train <- predict(optimal_ranger, spotify_train)
+rmse_optimal_ranger_train <- sqrt(mean((spotify_train$Popularity - pred_ranger_train$predictions)^2))
+rmse_optimal_ranger_train
+
+pred_ranger_test <- predict(optimal_ranger, spotify_test)
+rmse_optimal_ranger_test <- sqrt(mean((spotify_test$Popularity - pred_ranger_test$predictions)^2))
+rmse_optimal_ranger_test
+```
+

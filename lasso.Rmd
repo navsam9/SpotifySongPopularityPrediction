@@ -1,0 +1,163 @@
+---
+title: "lasso"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# load dataset
+spotify_data <- read.csv("spotify_dataset.csv")
+spotify_data <- spotify_data[complete.cases(spotify_data) , ]
+variables <- c("Popularity", "Danceability", "Energy", "Loudness", 
+               "Speechiness", "Acousticness", "Liveness", "Tempo", 
+               "Valence", "Chord", "Duration..ms.")
+spotify_data <- spotify_data[variables]
+spotify_data$Chord <- as.factor(spotify_data$Chord)
+```
+
+### LASSO
+
+```{r}
+library(glmnet)
+
+ols <- lm(Popularity ~ ., data = spotify_data)
+
+x <- model.matrix(ols)
+x <- x[, -1]
+y <- spotify_data$Popularity
+
+set.seed(123)
+lambdas <- exp(seq(-10, 0, length = 100))
+lasso <- cv.glmnet(x = x, y = y, nfolds = 10, alpha = 1,
+                   family = "gaussian", intercept = TRUE)
+
+lasso
+```
+
+### Coefficients
+
+```{r}
+coefs = coefficients(lasso, s = "lambda.min")
+preds.glmnet = predict(lasso, newx = x, s = "lambda.1se") 
+
+coefs
+```
+The coefficients for Danceability, Energy, and ChordD are removed by variable selection.
+
+### Plot LASSO
+
+```{r}
+# CV curve
+plot(lasso)
+plot(lasso$glmnet.fit)
+```
+
+```{r}
+library(tidyverse)
+# comparing regularizers
+lasso_best_lam <- lasso$lambda.min
+coefs_lasso = coefficients(lasso, s = "lambda.min")
+
+var_names <- c(names(ols$coefficients))
+ols_est <- as.numeric(ols$coefficients)
+lasso_est <- as.numeric(coefs_lasso)
+
+df <- data.frame(var_names, ols_est, lasso_est)
+ggplot(data = df, aes(x = ols_est, y = var_names)) + geom_point(color='blue') +
+  geom_point(aes(lasso_est), color = 'orange') +
+  xlab("Coefficient Estimates") + ylab("Variable Names")
+```
+From the plot above, it can be seen that the coefficient estimates for the OLS estimates vary slightly more than the LASSO estimates. The coefficient estimates for LASSO calculated from lambda_min are mostly smaller in magnitude and LASSO has some coefficient estimates that are 0, which is expected. 
+
+### Decision Tree
+
+```{r}
+library(OneR)
+# split popularity into two categories: 0, 1
+spotify_data$Popularity <- bin(spotify_data$Popularity, nbins = 2, 
+                               labels = c(0, 1))
+y <- spotify_data$Popularity
+pop_counts <- table(y)
+pop_proportion <- pop_counts/length(y)
+round(pop_proportion, 4)
+```
+There is class imbalance that should be dealt with.
+
+```{r}
+# class imbalance
+library(ROSE)
+library(rpart)
+set.seed(123) 
+sample <- sample.int(n = nrow(spotify_data), 
+                     size = floor(.75*nrow(spotify_data)), replace = F)
+train <- spotify_data[sample, ]
+test  <- spotify_data[-sample, ]
+
+treeimb <- rpart(Popularity ~ ., data = train)
+pr_treeimb <- predict(treeimb, newdata = test)
+accuracy.meas(test$Popularity, pr_treeimb[,2])
+roc.curve(test$Popularity, pr_treeimb[,2])
+```
+We get AUC = 0.504, which is terrible.
+
+```{r}
+# random over sampling
+balanced_data <- ROSE(Popularity ~ ., data = spotify_data, seed = 123)$data
+table(balanced_data$Popularity)
+# split data
+set.seed(123) 
+sample <- sample.int(n = nrow(balanced_data), 
+                     size = floor(.75*nrow(balanced_data)), replace = F)
+balanced_train <- balanced_data[sample, ]
+balanced_test  <- balanced_data[-sample, ]
+y_train <- as.factor(balanced_data[sample, 1])
+y_test <- as.factor(balanced_data[-sample, 1])
+
+tree_balanced <- rpart(Popularity ~ ., data = balanced_train)
+pr_balanced <- predict(tree_balanced, newdata = balanced_test)
+roc.curve(balanced_test$Popularity, pr_balanced[,2])
+```
+We obtain an AUC of 0.703 which is better.
+
+### KNN
+
+```{r}
+library(class)
+# normalize data
+nor <-function(x) {(x -min(x))/(max(x)-min(x))}
+balanced_data <- as.data.frame(lapply(balanced_data[,c(2,3,4,5,6,7,8,9,11)], nor))
+# split data
+set.seed(123) 
+sample <- sample.int(n = nrow(balanced_data), 
+                     size = floor(.75*nrow(balanced_data)), replace = F)
+balanced_train <- balanced_data[sample, ]
+balanced_test  <- balanced_data[-sample, ]
+
+kmax <- 20
+err <- double(kmax)
+for (ii in 1:kmax) {
+  pk <- knn.cv(balanced_train[,-9], y_train, k = ii)
+  err[ii] <- mean(pk != y_train)
+}
+err.x <- 1:20
+plot(err.x, err, type = "l")
+```
+$K = 13$ returns the lowest error.
+
+```{r}
+# KNN with k = 13
+pr <- knn(balanced_train, balanced_test, cl=y_train, k=13)
+
+# confusion matrix
+tb <- table(pr,y_test)
+tb
+
+# accuracy
+accuracy <- function(x){sum(diag(x)/(sum(rowSums(x))))}
+round(accuracy(tb), 4)
+```
+We get an accuracy of 0.7158 on the test set.
